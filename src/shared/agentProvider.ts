@@ -652,6 +652,48 @@ export function inferAgentProvider(command: string | undefined, explicit?: unkno
   return 'custom';
 }
 
+/**
+ * Remove a top-level model flag (`--model <value>`) from an argv array and
+ * return the value it carried. Only the first flag/value pair is lifted; any
+ * VALUELESS stray `--model` is dropped so the CLI never sees a dangling flag.
+ * Everything else passes through in order.
+ *
+ * WHY. The renderer-built command string keeps carrying `--model` (so Add/Edit
+ * Agent, the agent record and the UI stay unchanged), but main must NOT hand it
+ * to every engine: the packaged OpenCode desktop V2 CLI rejects a top-level
+ * `--model` outright ("Unrecognized flag: --model", crash 2026-10-22T10:18Z).
+ * spawnAgentCore lifts the value here and re-routes it into the engine's config
+ * injection (opencode's documented top-level `model` field), which BOTH opencode
+ * CLI variants read. Pure so it is unit-testable without Electron. */
+export function takeTopLevelModelFlag(
+  args: string[],
+  flag = '--model'
+): { args: string[]; model: string } {
+  const out: string[] = [];
+  let model = '';
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== flag) {
+      out.push(args[i]);
+      continue;
+    }
+    // Exact-token match (a `--model-config` must survive a `--model` lift and
+    // vice versa). The token that follows counts as the VALUE only when it
+    // exists and is not itself a flag — `--model --prompt x` has no value, and
+    // swallowing `--prompt` would silently delete a different argument.
+    const next = i + 1 < args.length ? args[i + 1] : undefined;
+    const isValue = typeof next === 'string' && next !== '' && !next.startsWith('-');
+    if (isValue) {
+      // First pair wins (the renderer emits exactly one); repeat pairs are
+      // consumed too — leaving their value behind would turn it into an
+      // orphan positional the CLI could misread as a prompt.
+      if (!model) model = next;
+      i++;
+    }
+    // The flag itself is always dropped.
+  }
+  return { args: out, model };
+}
+
 /** The structured bridge descriptor for how a non-hiveAware provider receives hive
  *  lifecycle events. Returns the preset's explicit `bridge` when set (proxy tier:
  *  qwen); else derives `{kind:'hooks', shim}` from the legacy `hookBridge`

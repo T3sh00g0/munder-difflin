@@ -2724,11 +2724,19 @@ export class HiveManager {
    */
   recordAgentExit(
     agentId: string,
-    info: { exitCode?: number; signal?: number; tail?: string; command?: string }
+    info: { exitCode?: number; signal?: number; tail?: string; command?: string; spawnCommand?: string }
   ): void {
     const root = this.root();
     if (!root) return;
-    const { exitCode, signal, tail, command } = info;
+    const { exitCode, signal, tail, command, spawnCommand } = info;
+    // TSF-16 observability: the spawn command line as ACTUALLY executed travels
+    // with the death (PtyExitInfo.spawnCommand → index.ts's exit handler). It
+    // carries the full argv — prompts, paths, and potentially engine tokens —
+    // so it is REDACTED here, once, before any disk write: the crashes/ dump
+    // keeps the readable diagnostic and log.jsonl (a committed file) keeps only
+    // the masked line. Without the redaction a misquoting bug that leaked a
+    // secret into argv would leak it permanently.
+    const spawnLine = spawnCommand ? redactSecrets(spawnCommand) : null;
     // A signal means killed (SIGILL/SIGSEGV/SIGKILL); node-pty reports exitCode 0
     // in that case, so signal must be checked independently of the code.
     const abnormal = (typeof signal === 'number' && signal !== 0) || (typeof exitCode === 'number' && exitCode !== 0);
@@ -2748,6 +2756,10 @@ export class HiveManager {
           `exitCode: ${String(exitCode)}`,
           `signal:   ${String(signal)}`,
           command ? `command:  ${command}` : null,
+          // TSF-16: the line AS EXECUTED (redacted) — the fact the crash logs
+          // always lacked. Distinguishes "engine rejected this argv" from
+          // "resolved exe was right and the CLI crashed on its own".
+          spawnLine ? `spawnCmd: ${spawnLine}` : null,
           `captured: ${new Date().toISOString()}`,
           `--- last ${tail.length} bytes of pty output ---`,
           ''
@@ -2771,6 +2783,10 @@ export class HiveManager {
       exitCode: exitCode ?? null,
       signal: signal ?? null,
       abnormal: true,
+      // Redacted spawn line (see above) — log.jsonl is a committed, non-hateful
+      // diagnostics file by design; it may carry the masked line but never argv
+      // verbatim.
+      ...(spawnLine ? { spawnCommand: spawnLine } : {}),
       tailPath
     });
   }

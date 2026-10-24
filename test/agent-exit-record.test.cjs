@@ -26,7 +26,7 @@ const os = require('node:os');
 const path = require('node:path');
 const loadTs = require('./load-ts.cjs');
 
-const { HiveManager } = loadTs('src/main/hive.ts');
+const { HiveManager, redactSecrets } = loadTs('src/main/hive.ts');
 
 function tmpHome() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'md-exit-'));
@@ -116,4 +116,86 @@ test('a death is still recorded when there is no output to dump', async (t) => {
   assert.equal(rows.length, 1, 'losing the output must not lose the fact of the death');
   assert.equal(rows[0].signal, 9);
   assert.equal(rows[0].tailPath, null);
+});
+
+// ── redacted spawn command line (TSF-16 observability) ──────────────────────
+// PTY exits now carry the FULL command line AS EXECUTED so a spawn failure is
+// diagnosable in one step (crashes 10-20→10-22 carried only the resolved exe,
+// and "Linha de comando muito longa" had to be inferred). The line may contain
+// engine tokens, so it is redacted BEFORE any disk write — THROUGH the hive's
+// house redactSecrets (same battery that guards messages), by design: one
+// choke point, one tested mask. The disabled dump keeps the readable
+// diagnostic; log.jsonl (committed) keeps only the masked line.
+
+test('redactSecrets masks credentials but keeps the line readable', () => {
+  const line = 'opencode run --model anthropic/claude-sonnet-4-5 --api-key sk-ant-EXAMPLE-1234567890 -H "Authorization: Bearer eyJa.aaa.bbb"';
+  const out = redactSecrets(line);
+  assert.ok(out.includes('--model anthropic/claude-sonnet-4-5'), 'model slug survives');
+  assert.ok(out.includes('--api-key'), 'the flag survives');
+  assert.ok(!out.includes('sk-ant-EXAMPLE'), 'sk- tokens are masked');
+  assert.ok(!out.includes('eyJa'), 'JWT/bearer values are masked');
+  assert.ok(!/Bearer [A-Za-z0-9]/.test(out), 'bearer values are masked');
+  assert.ok(out.includes('[redacted]'), 'the mask is named');
+});
+
+test('redactSecrets masks key=value params WITHOUT blanket-redacting entropy', () => {
+  const line = 'cli --token=abcd1234efgh5678ijkl --randomarg AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const out = redactSecrets(line);
+  assert.ok(out.includes('--token='), 'flag survives');
+  assert.ok(!out.includes('abcd1234efgh'), 'token value is gone');
+  // House policy (see redactSecrets doc): NO entropy-based masking — an unnamed
+  // long blob may be a git SHA or a path segment, so it SURVIVES; only
+  // credential-shaped values are dropped.
+  assert.ok(out.includes('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'), 'unnamed blob survives');
+});
+
+test('redactSecrets leaves ordinary spawn lines byte-identical', () => {
+  const line = 'C:\\Users\\r\\AppData\\Local\\Programs\\@opencodedesktop\\resources\\opencode-cli.exe --prompt "ola" --model p/m';
+  assert.strictEqual(redactSecrets(line), line, 'no false positive on ordinary argv');
+});
+
+test('a token-bearing spawnCommand is redacted in BOTH dump and log.jsonl', async (t) => {
+  const { home, hive } = await freshHive(t);
+  const token = 'sk-ant-EXAMPLE-NOT-A-REAL-KEY-000';
+  hive.recordAgentExit('a1', {
+    exitCode: 1,
+    tail: 'Linha de comando muito longa.\n',
+    command: 'C:\\npm\\opencode.cmd',
+    spawnCommand: `C:\\npm\\opencode.cmd --api-key ${token} --prompt "ola"`
+  });
+
+  const rows = readLog(home).filter((r) => r.kind === 'agent-exit');
+  assert.equal(rows.length, 1);
+  assert.ok(rows[0].spawnCommand, 'log.jsonl row carries the spawn line');
+  assert.ok(!JSON.stringify(rows).includes(token), 'log.jsonl never carries the raw token');
+  assert.ok(rows[0].spawnCommand.includes('[redacted]'), 'the value is masked in log.jsonl');
+  assert.ok(rows[0].spawnCommand.includes('--api-key'), 'the flag is kept for triage');
+
+  const dump = fs.readFileSync(rows[0].tailPath, 'utf8');
+  assert.ok(dump.includes('spawnCmd: '), 'the dump header names the spawn line');
+  assert.ok(!dump.includes(token), 'the dump masks the token too');
+  assert.ok(dump.includes('--prompt'), 'the rest of the line survives for diagnosis');
+});
+
+test('a clean spawnCommand passes through unchanged', async (t) => {
+  const { home, hive } = await freshHive(t);
+  const line = 'C:\\npm\\opencode.cmd --prompt "ola"';
+  hive.recordAgentExit('a1', { exitCode: 1, tail: 'boom\n', spawnCommand: line });
+
+  const rows = readLog(home).filter((r) => r.kind === 'agent-exit');
+  assert.equal(rows.length, 1);
+  assert.strictEqual(rows[0].spawnCommand, line, 'no false redaction on ordinary argv');
+  const dump = fs.readFileSync(rows[0].tailPath, 'utf8');
+  assert.ok(dump.includes(line), 'the dump carries the verbatim line');
+});
+
+test('no spawnCommand → no spawnCmd field anywhere', async (t) => {
+  const { home, hive } = await freshHive(t);
+  hive.recordAgentExit('a1', { exitCode: 1, tail: 'boom\n', spawnCommand: undefined });
+
+  const rows = readLog(home).filter((r) => r.kind === 'agent-exit');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].spawnCommand, undefined, 'log.jsonl row omits the field');
+  const dump = fs.readFileSync(rows[0].tailPath, 'utf8');
+  assert.ok(!dump.includes('spawnCmd:'), 'dump header omits the row');
 });

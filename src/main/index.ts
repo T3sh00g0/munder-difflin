@@ -81,6 +81,7 @@ import {
   nonInteractiveEnvForProvider,
   normalizeAgentProvider,
   providerPreset,
+  takeTopLevelModelFlag,
   installInfoForProvider,
   type AgentProvider
 } from '../shared/agentProvider';
@@ -612,7 +613,8 @@ ptyManager.setExitHandler((id, exitCode, info) => {
         exitCode,
         signal: info?.signal,
         tail: info?.tail,
-        command: info?.command
+        command: info?.command,
+        spawnCommand: info?.spawnCommand
       });
     }
   } catch (e) { console.error('[pty] recordAgentExit failed:', e); }
@@ -3018,8 +3020,20 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     //    spawned model's provider prefix when we can identify it; fall back to all
     //    stored keys when the model/prefix is unknown (default model, qwen slugs,
     //    custom). Reduces the blast radius vs handing every CLI all keys.
-    const modelIdx = (opts.args ?? []).indexOf('--model');
-    const modelSlug = modelIdx >= 0 ? (opts.args?.[modelIdx + 1] ?? '') : '';
+    // OpenCode (TSF-16 mode b): the model never rides argv. The packaged desktop
+    // V2 CLI rejects a top-level `--model` OUTRIGHT — "Unrecognized flag: --model",
+    // exit 1 six seconds after app-start (crash 2026-10-22T10:18Z) — so every
+    // spawn against that CLI died first thing. The renderer-built command string
+    // still CARRIES `--model` (Add/Edit Agent, the agent record and the UI are
+    // unchanged); here it is lifted off argv once and the value moves into the
+    // config injection below — `model` is the documented top-level opencode.json
+    // field, read by BOTH opencode CLI variants (npm TUI + desktop). The same
+    // value keeps driving the BYOK scoping that follows.
+    const carriedModel = provider === 'opencode'
+      ? takeTopLevelModelFlag(opts.args ?? [])
+      : { args: opts.args ?? [], model: '' };
+    if (provider === 'opencode') opts.args = carriedModel.args;
+    const modelSlug = carriedModel.model;
     const prefix = modelSlug.includes('/') ? modelSlug.split('/')[0].toLowerCase() : '';
     const PREFIX_BACKEND: Record<string, string> = {
       anthropic: 'anthropic', openai: 'openai', google: 'google', gemini: 'google', groq: 'groq', openrouter: 'openrouter'
@@ -3041,6 +3055,10 @@ async function spawnAgentCore(opts: AgentSpawnOptions, owner: Electron.WebConten
     //    env var, built dynamically so permission:allow is GATED on autoMode (#2).
     if (provider === 'opencode') {
       const oc: Record<string, unknown> = { autoupdate: false };
+      // TSF-16 mode (b): the selected model is carried HERE, in the config
+      // injection (the documented top-level `model` field), never on argv —
+      // the packaged desktop V2 CLI rejects an argv `--model` (comment above).
+      if (modelSlug) oc.model = modelSlug;
       if (cfg.autoMode) oc.permission = { edit: 'allow', bash: 'allow', webfetch: 'allow' };
       const baseUrl = cfg.providerBaseUrls?.opencode;
       if (baseUrl) {

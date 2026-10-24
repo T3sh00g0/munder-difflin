@@ -93,6 +93,60 @@ test('codex preset still resolves (no regression)', () => {
   assert.strictEqual(ap.providerPreset('codex').defaultCommand, 'codex');
 });
 
+// ── takeTopLevelModelFlag (TSF-16 mode b) ────────────────────────────────────
+// The packaged OpenCode desktop V2 CLI rejects a top-level --model outright
+// ("Unrecognized flag: --model", crash 2026-10-22T10:18Z), so spawnAgentCore
+// lifts the value off argv and re-routes it into the config injection. These
+// pin the pure helper that does the lifting.
+
+test('takeTopLevelModelFlag strips --model and its value from argv', () => {
+  const r = ap.takeTopLevelModelFlag(['opencode', '--model', 'anthropic/claude-sonnet-4-5']);
+  assert.deepStrictEqual(r.args, ['opencode']);
+  assert.strictEqual(r.model, 'anthropic/claude-sonnet-4-5');
+});
+
+test('takeTopLevelModelFlag strips the flag wherever it sits', () => {
+  const r = ap.takeTopLevelModelFlag(['--prompt', 'hi', '--model', 'openai/gpt-5.6']);
+  assert.deepStrictEqual(r.args, ['--prompt', 'hi']);
+  assert.strictEqual(r.model, 'openai/gpt-5.6');
+});
+
+test('takeTopLevelModelFlag is a no-op when the flag is absent', () => {
+  const r = ap.takeTopLevelModelFlag(['opencode', '--prompt', 'x']);
+  assert.deepStrictEqual(r.args, ['opencode', '--prompt', 'x']);
+  assert.strictEqual(r.model, '');
+});
+
+test('takeTopLevelModelFlag drops a stray valueless --model', () => {
+  // A dangling flag must never reach the CLI: exactly that shape is what the
+  // desktop CLI treats as fatal.
+  const r = ap.takeTopLevelModelFlag(['opencode', '--model']);
+  assert.deepStrictEqual(r.args, ['opencode']);
+  assert.strictEqual(r.model, '');
+});
+
+test('takeTopLevelModelFlag keeps only the FIRST pair and consumes repeats fully', () => {
+  // A repeat pair must not leave its value behind as an orphan positional —
+  // the CLI could misread `c/d` as a prompt.
+  const r = ap.takeTopLevelModelFlag(['--model', 'a/b', '--model', 'c/d']);
+  assert.deepStrictEqual(r.args, []);
+  assert.strictEqual(r.model, 'a/b');
+});
+
+test('takeTopLevelModelFlag honours a custom flag name by EXACT token only', () => {
+  // Lifting `--model-verbose` must not eat `--model` (a different token) —
+  // nor its value.
+  const r = ap.takeTopLevelModelFlag(['--model-config', 'x', '--model-verbose', '--model', 'p/m'], '--model-verbose');
+  assert.deepStrictEqual(r.args, ['--model-config', 'x', '--model', 'p/m']);
+  assert.strictEqual(r.model, '');
+});
+
+test('takeTopLevelModelFlag never swallows a following flag as the value', () => {
+  const r = ap.takeTopLevelModelFlag(['--model', '--prompt', 'hi']);
+  assert.deepStrictEqual(r.args, ['--prompt', 'hi']);
+  assert.strictEqual(r.model, '');
+});
+
 if (failures > 0) {
   console.log(`\n${failures} test(s) failed`);
   process.exit(1);

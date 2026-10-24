@@ -45,6 +45,13 @@ export interface PtyExitInfo {
   signal?: number;
   tail?: string;
   command?: string;
+  /** The FULL command line as actually executed (post-shim-decode `file` +
+   *  every arg; or the verbatim pre-escaped string on the cmd.exe route).
+   *  Redacted by the caller BEFORE it is written anywhere durable — see
+   *  recordAgentExit. This is what makes a spawn failure diagnosable in one
+   *  step (TSF-16: the crash logs carried only the resolved exe, never the
+   *  line, so " linha de comando muito longa" had to be inferred). */
+  spawnCommand?: string;
   cwd?: string;
 }
 
@@ -75,6 +82,10 @@ interface PtySession {
   /** True after the child has emitted at least one frame. Automation waits for
    *  this before typing, so startup prompts cannot outrun the TUI subscription. */
   hasOutput: boolean;
+  /** The FULL command line actually executed (see PtyExitInfo.spawnCommand).
+   *  Computed once at spawn and handed to the exit handler so an abnormal
+   *  death carries its own invocation, redacted before any disk write. */
+  spawnLine: string;
 }
 
 export interface SpawnOptions {
@@ -671,8 +682,14 @@ export class PtyManager {
         // argument is actually at risk in THIS spawn.
         if (needsCmd) {
           const multiline = (opts.args ?? []).some((a) => a.includes('\n'));
+          // TSF-16 mode (a): cmd.exe hard-caps one command line near 8191 chars
+          // and aborts with " linha de comando muito longa" (exit 1) — six god
+          // crashes 10-20→10-22 were exactly this. Surface the REAL line size so
+          // the warning predicts the abort instead of hinting at it.
+          const lineLen = buildCmdCommandLine(resolved, opts.args ?? []).length;
           console.warn(
             `[pty] Windows: "${resolved}" could not be decoded as an npm shim — falling back to cmd.exe.` +
+            ` Command line is ${lineLen} chars (cmd.exe rejects near 8191).` +
             (multiline
               ? ' A MULTI-LINE ARGUMENT IS PRESENT AND WILL BE TRUNCATED AT ITS FIRST NEWLINE.' +
                 ' The agent will start and look healthy without ever receiving the hive protocol.'
@@ -680,6 +697,13 @@ export class PtyManager {
           );
         }
       }
+      // The line AS EXECUTED (post-shim-decode): the real `file` plus every arg,
+      // or the verbatim pre-escaped string on the cmd.exe route. Recorded on the
+      // session and handed to the exit handler so an abnormal death carries its
+      // own invocation (redaction happens at the WRITE site — recordAgentExit).
+      const spawnLine = typeof spawnArgs === 'string'
+        ? `${file} ${spawnArgs}`
+        : [file, ...spawnArgs].join(' ');
       const proc = pty.spawn(file, spawnArgs, {
         name: 'xterm-256color',
         cols: opts.cols ?? 100,
@@ -704,6 +728,7 @@ export class PtyManager {
         proc,
         cwd: opts.cwd,
         command: resolved,
+        spawnLine,
         lastOutputAt: Date.now(),
         hasOutput: false,
         tail: '',
@@ -743,6 +768,7 @@ export class PtyManager {
             signal,
             tail: session.tail,
             command: session.command,
+            spawnCommand: session.spawnLine,
             cwd: session.cwd
           });
         } catch { /* never throw out of onExit */ }
